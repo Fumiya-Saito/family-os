@@ -1,0 +1,30 @@
+# Dependencies
+node_modules/
+
+# Cloudflare Workers / Wrangler
+.wrangler/
+.dev.vars
+dist/
+worker/
+
+# Environment Variables
+.env
+.env.local
+.env.production
+
+# IDEs & Editors
+.vscode/*
+!.vscode/launch.json
+!.vscode/*.code-snippets
+.idea/
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS specific
+.DS_Store
+Thumbs.db
