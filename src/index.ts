@@ -6,7 +6,7 @@ import { GoogleGenerativeAI } from '@google/generative-ai'
 import { messagingApi, WebhookEvent } from '@line/bot-sdk'
 import { z } from 'zod'
 import { sign, verify } from 'hono/jwt'
-import { generateResultFlex } from './flexMessages'
+import { generateFlexMessages, createConfirmBubble } from './flexMessages'
 
 type Bindings = {
   GOOGLE_CLIENT_ID: string
@@ -39,10 +39,10 @@ app.use('/settings/*', csrf())
 // -- Zod Schema --
 const EventSchema = z.object({
   summary: z.string(),
-  start: z.string().regex(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/, "Invalid date format"),
-  end: z.string().optional(),
-  location: z.string().optional(),
-  description: z.string().optional(),
+  start: z.string(),
+  end: z.string().nullable().optional(),
+  location: z.string().nullable().optional(),
+  description: z.string().nullable().optional(),
   target: z.string().nullable().optional()
 })
 const ResponseSchema = z.object({
@@ -320,7 +320,11 @@ app.post('/webhook', async (c) => {
   if (!isValid) return c.text('Unauthorized', 401)
 
   const body = JSON.parse(rawBody)
-  c.executionCtx.waitUntil(handleEvents(body.events, c.env, c.req.url))
+  // ログ出力のためにcatchを追加
+  c.executionCtx.waitUntil(
+      handleEvents(body.events, c.env, c.req.url)
+        .catch(err => console.error('🚨 Global Error in handleEvents:', err))
+  )
   return c.json({ message: 'ok' })
 })
 
@@ -333,7 +337,7 @@ async function handleEvents(events: WebhookEvent[], env: Bindings, reqUrl: strin
   
   for (const event of events) {
     // ---------------------------------------------------------
-    // ■ Undo機能 (Postback処理)
+    // ■ Postback処理 (Undo / Rescue)
     // ---------------------------------------------------------
     if (event.type === 'postback') {
       const data = new URLSearchParams(event.postback.data)
@@ -341,8 +345,223 @@ async function handleEvents(events: WebhookEvent[], env: Bindings, reqUrl: strin
       const targetMsgId = data.get('msgId')
       const userId = event.source.userId
       
-      if (action === 'undo' && targetMsgId && userId) {
-        // 1. DBから削除対象のイベントを取得
+      if (!targetMsgId || !userId) continue
+
+      // (解析実行ロジック) 
+      if (action === 'analyze') {
+         // 1. 二重処理防止
+         const { error } = await supabase.from('processed_messages').insert({ message_id: targetMsgId })
+         if (error) { 
+            await client.replyMessage({ 
+                replyToken: event.replyToken, 
+                messages: [{ type: 'text', text: '⚠️ すでに解析済みか、エラーが発生しました' }] 
+            })
+            continue 
+         }
+
+         try {
+             // ユーザー情報・認証取得
+             const { data: userData } = await supabase.from('users').select('keywords').eq('line_user_id', userId).single()
+             const { data: authData } = await supabase.from('google_auth').select('*').eq('user_id', userId).single()
+             const userKeywords: string[] = userData?.keywords || []
+
+             if (!authData) {
+                const payload = { sub: userId, exp: Math.floor(Date.now() / 1000) + 600 }
+                const token = await sign(payload, env.JWT_SECRET, 'HS256')
+                const lpUrl = `${baseUrl}/auth/landing?userId=${userId}`
+                await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text', text: `連携が必要です👇\n${lpUrl}` }] })
+                continue
+             }
+
+             // 画像取得 (LINEサーバーから)
+             const imgRes = await fetchWithRetry(`https://api-data.line.me/v2/bot/message/${targetMsgId}/content`, {
+                 headers: { Authorization: `Bearer ${env.LINE_CHANNEL_ACCESS_TOKEN}` }
+             })
+             
+             if (!imgRes.ok) throw new Error('画像が期限切れ等のため取得できませんでした')
+             const imageBuffer = await imgRes.arrayBuffer()
+
+             // Gemini API 呼び出し
+             const genAI = new GoogleGenerativeAI(env.GEMINI_API_KEY)
+             const model = genAI.getGenerativeModel({ model: MODEL_NAME, generationConfig: { responseMimeType: "application/json" } })
+             
+             const now = new Date()
+             const jstNow = new Date(now.toLocaleString("en-US", { timeZone: "Asia/Tokyo" }))
+             
+             // ★プロンプト (いただいた最新版をそのまま適用)
+             const prompt = `あなたは学校プリント解析のプロ。JSON出力のみ。
+             本日:${jstNow.toISOString().split('T')[0]} (YYYY-MM-DD)
+             
+             スキーマ: { "events": [{ "summary": string, "start": "YYYY-MM-DDTHH:mm:ss", "end": string?, "location": string?, "description": string?, "target": string? }] }
+             
+             抽出ルール:
+             1. イベント: 行事予定のみ抽出。「給食の献立」「今月の目標」「校長先生の挨拶」はノイズとして無視。
+             
+             2. 日付 (誤認に注意): 
+                - 「1年2組」「1-2」のような【学年・クラス表記】を日付(1月2日)と混同するな。これは日付ではない。
+                - 月が明記されていない日付（例: "15日"）は、リストの並び順（時系列）を見て補完せよ。前の行より数字が小さくなった場合（例: 25日の次に3日が来た場合）のみ翌月と判断せよ。
+                - 本日の月と比較し、イベント月が明らかに小さい場合（例: 本日が12月でイベントが1月）は翌年、それ以外は${jstNow.getFullYear()}年とする。
+             
+             3. 時間: 開始時刻不明なら "00:00:00"。「午前保育」等は description に記載。
+             
+             4. 対象(target) 【重要】: 
+                - 「年少児保護者」のように学年指定がある場合は抽出。
+                - その行事に関係する「学年」「クラス」を【カンマ区切り】で可能な限り列挙・展開せよ。
+                - 表記は「X年Y組」「X年」に統一せよ（例: 「1-2」→「1年2組」）。
+                - クラス行事であっても、親となる学年を含めよ（例: 「1年2組」なら "1年2組, 1年"）。
+                - 範囲指定は展開せよ（例: 「1〜3年」なら "1年, 2年, 3年"）。
+                - 「○月生まれ」「保護者」などの記述は学年指定ではないためターゲットに含めるな。学年指定がなければ空文字 (全員対象) とせよ。
+             
+             5. 場所・詳細: locationに場所、descriptionに持ち物や注意事項を記載。
+             `
+
+             const result = await model.generateContent([
+                prompt,
+                { inlineData: { data: Buffer.from(imageBuffer).toString('base64'), mimeType: "image/jpeg" } }
+             ])
+             
+             let allEvents = []
+             try {
+               const cleanJson = extractJson(result.response.text())
+               const json = JSON.parse(cleanJson)
+               allEvents = ResponseSchema.parse(json).events
+             } catch (e) {
+               console.error('Parse Error:', e)
+               await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text', text: '読み取れませんでした💦' }] })
+               continue
+             }
+
+             if (allEvents.length === 0) {
+               await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text', text: '予定が見つかりませんでした🙏' }] })
+               continue
+             }
+
+             const keptEvents: any[] = []
+             const ignoredEvents: any[] = []
+
+             // ★正規化ロジック (いただいた最新版をそのまま適用)
+             // キーワード正規化ヘルパー: "1-2" -> "12", "1年2組" -> "12" のように揺れを吸収
+             const normalize = (str: string) => str.replace(/[０-９]/g, s => String.fromCharCode(s.charCodeAt(0) - 0xFEE0)) // 全角数字→半角
+                                                   .replace(/[-－ー]/g, '') // ハイフン除去
+                                                   .replace(/[年組生]/g, '') // 単位除去
+
+             for (const ev of allEvents) {
+               const safeTarget = sanitizeText(ev.target, 50)
+       
+               // 1. 「以外」「除く」が含まれていたら即除外
+               if (safeTarget.includes('以外') || safeTarget.includes('除く')) {
+                 ignoredEvents.push(ev)
+                 continue 
+               }
+       
+               // 2. 双方向チェック (親子関係・表記ゆれ対応)
+               const isMatch = userKeywords.length > 0 && userKeywords.some(kw => {
+                  // A. そのままの文字列で比較 (基本)
+                  if (safeTarget.includes(kw) || (safeTarget.length > 0 && kw.includes(safeTarget))) return true
+                  
+                  // B. 正規化して比較 (救済策: "1-2" vs "1年2組" など)
+                  const nKw = normalize(kw)
+                  const nTarget = normalize(safeTarget)
+                  
+                  // 正規化後の文字数が少なすぎる場合（"1"だけ等）は誤爆防止のためチェックしない
+                  if (nKw.length < 2 || nTarget.length < 2) return false
+                  
+                  return nTarget.includes(nKw) || nKw.includes(nTarget)
+               })
+       
+               const isAll = !safeTarget || safeTarget.includes('全')
+               const noSettings = userKeywords.length === 0
+       
+               if (isAll || noSettings || isMatch) {
+                 keptEvents.push(ev)
+               } else {
+                 ignoredEvents.push(ev)
+               }
+             }
+
+             // Googleトークンリフレッシュ
+             let accessToken = authData.access_token
+             if (Date.now() > (authData.expiry_date || 0)) {
+                const newTokens = await (await fetchWithRetry('https://oauth2.googleapis.com/token', {
+                  method: 'POST', 
+                  headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                  body: new URLSearchParams({ client_id: env.GOOGLE_CLIENT_ID, client_secret: env.GOOGLE_CLIENT_SECRET, refresh_token: authData.refresh_token, grant_type: 'refresh_token' })
+                })).json() as GoogleTokenResponse
+                
+                if (newTokens.error) throw new Error('Refresh Failed')
+                accessToken = newTokens.access_token
+                await supabase.from('google_auth').update({ access_token: accessToken, expiry_date: Date.now() + 3500 * 1000 }).eq('user_id', userId)
+             }
+
+             // カレンダー登録
+             const calendarPromises = keptEvents.map(async (ev) => {
+               const res = await fetchWithRetry('https://www.googleapis.com/calendar/v3/calendars/primary/events', {
+                   method: 'POST',
+                   headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+                   body: JSON.stringify({
+                     summary: sanitizeText(ev.summary, 100),
+                     location: sanitizeText(ev.location, 100),
+                     description: sanitizeText(ev.description, 1000),
+                     start: { dateTime: ev.start, timeZone: 'Asia/Tokyo' },
+                     end: { dateTime: ev.end || ev.start, timeZone: 'Asia/Tokyo' }
+                   })
+               })
+               const data = await res.json() as any
+               if (data && data.id) {
+                 return { ...ev, googleId: data.id }
+               }
+               return null
+             })
+      
+             const results = await Promise.all(calendarPromises)
+             const registeredEvents = results.filter((r): r is any => r !== null)
+
+             // DB保存: Undo用
+             if (registeredEvents.length > 0) {
+               await supabase.from('calendar_events').insert(
+                 registeredEvents.map(ev => ({
+                   user_id: userId,
+                   google_event_id: ev.googleId,
+                   source_message_id: targetMsgId,
+                   summary: ev.summary,
+                   start_time: ev.start
+                 }))
+               )
+             }
+      
+             // DB保存: Rescue用
+             if (ignoredEvents.length > 0) {
+               await supabase.from('parsing_logs').insert({
+                 message_id: targetMsgId,
+                 ignored_events: ignoredEvents
+               })
+             }
+
+             if (registeredEvents.length === 0 && ignoredEvents.length === 0) {
+               await client.replyMessage({
+                 replyToken: event.replyToken,
+                 messages: [{ type: 'text', text: '読み取れる予定がありませんでした🙏' }]
+               })
+               continue
+             }
+
+             const replyMessages = generateFlexMessages(registeredEvents, ignoredEvents, targetMsgId)
+             await client.replyMessage({
+                replyToken: event.replyToken,
+                messages: replyMessages as any
+             })
+
+         } catch (e: any) {
+             console.error(e)
+             await client.replyMessage({ 
+                 replyToken: event.replyToken, 
+                 messages: [{ type: 'text', text: `エラーが発生しました: ${e.message}` }] 
+             })
+         }
+      }
+
+      // Undo機能 (削除)
+      if (action === 'undo') {
         const { data: eventsToDelete } = await supabase
           .from('calendar_events')
           .select('*')
@@ -350,15 +569,13 @@ async function handleEvents(events: WebhookEvent[], env: Bindings, reqUrl: strin
           .eq('user_id', userId)
         
         if (!eventsToDelete || eventsToDelete.length === 0) {
-          await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text', text: '削除できるデータが見つかりませんでした（既に削除済みかもしれません）。' }] })
+          await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text', text: '削除できるデータが見つかりませんでした。' }] })
           continue
         }
 
-        // 2. Google Calendarから削除 (認証トークン取得)
         const { data: authData } = await supabase.from('google_auth').select('*').eq('user_id', userId).single()
         let accessToken = authData?.access_token
         
-        // トークンリフレッシュ処理 (必要な場合)
         if (authData && Date.now() > (authData.expiry_date || 0)) {
            const newTokens = await (await fetchWithRetry('https://oauth2.googleapis.com/token', {
               method: 'POST', 
@@ -369,22 +586,81 @@ async function handleEvents(events: WebhookEvent[], env: Bindings, reqUrl: strin
            await supabase.from('google_auth').update({ access_token: accessToken, expiry_date: Date.now() + 3500 * 1000 }).eq('user_id', userId)
         }
 
-        // 削除実行
         let deletedCount = 0
         for (const ev of eventsToDelete) {
           const res = await fetchWithRetry(`https://www.googleapis.com/calendar/v3/calendars/primary/events/${ev.google_event_id}`, {
             method: 'DELETE',
             headers: { Authorization: `Bearer ${accessToken}` }
           })
-          if (res.ok || res.status === 404) deletedCount++ // 404は既に消えているので成功扱い
+          if (res.ok || res.status === 404) deletedCount++
         }
 
-        // 3. DBから削除
         await supabase.from('calendar_events').delete().eq('source_message_id', targetMsgId)
+        await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text', text: `🗑️ ${deletedCount}件を取り消しました。` }] })
+      }
 
+      // Rescue機能 (救出)
+      if (action === 'rescue') {
+        const { data: logData } = await supabase.from('parsing_logs').select('ignored_events').eq('message_id', targetMsgId).single()
+        const ignoredEvents = logData?.ignored_events as any[]
+        
+        if (!ignoredEvents || ignoredEvents.length === 0) {
+          await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text', text: '救出できる予定が見つかりませんでした。' }] })
+          continue
+        }
+
+        // await client.replyMessage({ replyToken: event.replyToken, messages: [{ type: 'text', text: `🚑 ${ignoredEvents.length}件を救出中...` }] })
+
+        const { data: authData } = await supabase.from('google_auth').select('*').eq('user_id', userId).single()
+        let accessToken = authData?.access_token
+        if (authData && Date.now() > (authData.expiry_date || 0)) {
+           const newTokens = await (await fetchWithRetry('https://oauth2.googleapis.com/token', {
+              method: 'POST', 
+              headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+              body: new URLSearchParams({ client_id: env.GOOGLE_CLIENT_ID, client_secret: env.GOOGLE_CLIENT_SECRET, refresh_token: authData.refresh_token, grant_type: 'refresh_token' })
+           })).json() as GoogleTokenResponse
+           accessToken = newTokens.access_token
+           await supabase.from('google_auth').update({ access_token: accessToken, expiry_date: Date.now() + 3500 * 1000 }).eq('user_id', userId)
+        }
+
+        const rescuePromises = ignoredEvents.map(async (ev) => {
+          const res = await fetchWithRetry('https://www.googleapis.com/calendar/v3/calendars/primary/events', {
+              method: 'POST',
+              headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                summary: sanitizeText(ev.summary, 100),
+                location: sanitizeText(ev.location, 100),
+                description: sanitizeText(ev.description, 1000) + '\n(救出された予定)',
+                start: { dateTime: ev.start, timeZone: 'Asia/Tokyo' },
+                end: { dateTime: ev.end || ev.start, timeZone: 'Asia/Tokyo' }
+              })
+          })
+          const data = await res.json() as any
+          if (data && data.id) return { ...ev, googleId: data.id }
+          return null
+        })
+
+        const results = await Promise.all(rescuePromises)
+        const rescued = results.filter((r): r is any => r !== null)
+
+        if (rescued.length > 0) {
+          await supabase.from('calendar_events').insert(
+            rescued.map(ev => ({
+              user_id: userId,
+              google_event_id: ev.googleId,
+              source_message_id: targetMsgId,
+              summary: ev.summary,
+              start_time: ev.start
+            }))
+          )
+          await supabase.from('parsing_logs').delete().eq('message_id', targetMsgId)
+        }
+
+        const rescueMessages = generateFlexMessages(rescued, [], targetMsgId)
         await client.replyMessage({ 
           replyToken: event.replyToken, 
-          messages: [{ type: 'text', text: `🗑️ ${deletedCount}件の予定を取り消しました。元に戻りました！` }] 
+          // 念のため as any
+          messages: rescueMessages as any
         })
       }
       continue
@@ -408,168 +684,21 @@ async function handleEvents(events: WebhookEvent[], env: Bindings, reqUrl: strin
        continue
     }
 
-    if (event.type !== 'message' || event.message.type !== 'image') continue
-    const userId = event.source.userId
-    if (!userId) continue 
-
-    const messageId = event.message.id
-    const { error } = await supabase.from('processed_messages').insert({ message_id: messageId })
-    if (error) { console.log(`Duplicate`); continue }
-
-    const replyToken = event.replyToken
-    if (allowedUsers.length > 0 && !allowedUsers.includes(userId)) return
-
-    try {
-      const { data: userData } = await supabase.from('users').select('keywords').eq('line_user_id', userId).single()
-      const { data: authData } = await supabase.from('google_auth').select('*').eq('user_id', userId).single()
-      const userKeywords: string[] = userData?.keywords || []
-
-      if (!authData) {
-        const payload = { sub: userId, exp: Math.floor(Date.now() / 1000) + 600 }
-        const token = await sign(payload, env.JWT_SECRET, 'HS256')
-        const lpUrl = `${baseUrl}/auth/landing?userId=${userId}`
-        await client.replyMessage({ replyToken, messages: [{ type: 'text', text: `連携が必要です👇\n${lpUrl}` }] })
-        return
-      }
-
-      await client.replyMessage({ replyToken, messages: [{ type: 'text', text: '解析中...📸' }] })
-
-      const imgRes = await fetchWithRetry(`https://api-data.line.me/v2/bot/message/${messageId}/content`, {
-          headers: { Authorization: `Bearer ${env.LINE_CHANNEL_ACCESS_TOKEN}` }
-      })
-      const imageBuffer = await imgRes.arrayBuffer()
-
-      const genAI = new GoogleGenerativeAI(env.GEMINI_API_KEY)
-      const model = genAI.getGenerativeModel({ model: MODEL_NAME, generationConfig: { responseMimeType: "application/json" } })
-      
-      const now = new Date()
-      const jstNow = new Date(now.toLocaleString("en-US", { timeZone: "Asia/Tokyo" }))
-      
-      const prompt = `あなたは学校プリント解析のプロ。JSON出力のみ。
-      本日:${jstNow.toISOString().split('T')[0]} (YYYY-MM-DD)
-      
-      スキーマ: { "events": [{ "summary": string, "start": "YYYY-MM-DDTHH:mm:ss", "end": string?, "location": string?, "description": string?, "target": string? }] }
-      
-      抽出ルール:
-      1. イベント: 行事予定のみ抽出。「給食の献立」「今月の目標」「校長先生の挨拶」はノイズとして無視。
-      2. 日付: 本日の月と比較し、イベント月が明らかに小さい場合（例: 本日が12月でイベントが1月）は、翌年として処理せよ。それ以外は${jstNow.getFullYear()}年とする。
-      3. 時間: 開始時刻不明なら "00:00:00"。「午前保育」等は description に記載。
-      4. 対象(target): 
-         - 「年少児保護者」のように学年指定がある場合は "年少" のように抽出。
-         - 学年指定がなく「○月生まれ」「保護者」のみの場合は null (全員対象) とする。
-      5. 場所・詳細: locationに場所、descriptionに持ち物や注意事項を記載。
-      `
-
-      const result = await model.generateContent([
-        prompt,
-        { inlineData: { data: Buffer.from(imageBuffer).toString('base64'), mimeType: "image/jpeg" } }
-      ])
-      
-      let allEvents = []
-      try {
-        const cleanJson = extractJson(result.response.text())
-        const json = JSON.parse(cleanJson)
-        allEvents = ResponseSchema.parse(json).events
-      } catch (e) {
-        console.error('Parse Error:', e)
-        await client.pushMessage({ to: userId, messages: [{ type: 'text', text: '読み取れませんでした💦' }] })
-        return
-      }
-
-      if (allEvents.length === 0) {
-        await client.pushMessage({ to: userId, messages: [{ type: 'text', text: '予定が見つかりませんでした🙏' }] })
-        return
-      }
-
-      const keptEvents: any[] = []
-      const ignoredEvents: any[] = []
-
-      for (const ev of allEvents) {
-        const safeTarget = sanitizeText(ev.target, 50)
-        const isMatch = userKeywords.length > 0 && userKeywords.some(kw => safeTarget.includes(kw))
-        const isAll = !safeTarget || safeTarget.includes('全')
-        const noSettings = userKeywords.length === 0
-
-        if (isAll || noSettings || isMatch) {
-          keptEvents.push(ev)
-        } else {
-          ignoredEvents.push(ev)
-        }
-      }
-
-      let accessToken = authData.access_token
-      if (Date.now() > (authData.expiry_date || 0)) {
-         const newTokens = await (await fetchWithRetry('https://oauth2.googleapis.com/token', {
-            method: 'POST', 
-            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-            body: new URLSearchParams({ client_id: env.GOOGLE_CLIENT_ID, client_secret: env.GOOGLE_CLIENT_SECRET, refresh_token: authData.refresh_token, grant_type: 'refresh_token' })
-         })).json() as GoogleTokenResponse
-         
-         if (newTokens.error) throw new Error('Refresh Failed')
-         accessToken = newTokens.access_token
-         await supabase.from('google_auth').update({ access_token: accessToken, expiry_date: Date.now() + 3500 * 1000 }).eq('user_id', userId)
-      }
-
-      // -------------------------------------------------------
-      // ★修正: Google Calendar登録 & ID取得
-      // -------------------------------------------------------
-      
-      // バッチではなく1件ずつ登録して確実にIDを取得する (並列処理)
-      const calendarPromises = keptEvents.map(async (ev) => {
-        const res = await fetchWithRetry('https://www.googleapis.com/calendar/v3/calendars/primary/events', {
-            method: 'POST',
-            headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              summary: sanitizeText(ev.summary, 100),
-              location: sanitizeText(ev.location, 100),
-              description: sanitizeText(ev.description, 1000),
-              start: { dateTime: ev.start, timeZone: 'Asia/Tokyo' },
-              end: { dateTime: ev.end || ev.start, timeZone: 'Asia/Tokyo' }
-            })
-        })
-        
-        // ★修正点: 'as any' を追加して型エラーを回避
-        const data = await res.json() as any 
-        
-        if (data && data.id) {
-          return { ...ev, googleId: data.id } // 成功したらID付きで返す
-        }
-        return null
-      })
-
-      const results = await Promise.all(calendarPromises)
-      // nullを除外して、成功したイベントだけ抽出
-      const registeredEvents = results.filter((r): r is any => r !== null)
-
-      // -------------------------------------------------------
-      // ★修正: DBへの保存 (Undo機能用)
-      // -------------------------------------------------------
-      if (registeredEvents.length > 0) {
-        const { error: dbError } = await supabase.from('calendar_events').insert(
-          registeredEvents.map(ev => ({
-            user_id: userId,
-            google_event_id: ev.googleId,
-            source_message_id: messageId,
-            summary: ev.summary,
-            start_time: ev.start
-          }))
-        )
-        if (dbError) console.error('DB Insert Error:', dbError)
-      }
-
-      // -------------------------------------------------------
-      // ★修正: Flex Message 送信
-      // -------------------------------------------------------
-      const flexMsg = generateResultFlex(registeredEvents, ignoredEvents, messageId)
-      
-      await client.pushMessage({
-        to: userId,
-        messages: [{ type: 'flex', altText: `📅 ${registeredEvents.length}件の予定を登録しました`, contents: flexMsg }]
-      })
-
-    } catch (e: any) {
-      console.error(e)
-      await client.pushMessage({ to: userId, messages: [{ type: 'text', text: `エラーが発生しました: ${e.message}` }] })
+    // ---------------------------------------------------------
+    // ■ 画像処理フロー（コスト削減版）
+    // ---------------------------------------------------------
+    if (event.type === 'message' && event.message.type === 'image') {
+       const messageId = event.message.id
+       
+       // 確認バブルを作成
+       const confirmMsg = createConfirmBubble(messageId)
+       
+       // 無料の ReplyMessage でボタンを送る
+       await client.replyMessage({
+         replyToken: event.replyToken,
+         messages: [{ type: 'flex', altText: '📷 画像を確認しました', contents: confirmMsg as any }]
+       })
+       continue
     }
   }
 }
