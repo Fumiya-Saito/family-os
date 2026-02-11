@@ -6,7 +6,7 @@ import { GoogleGenerativeAI } from '@google/generative-ai'
 import { messagingApi, WebhookEvent } from '@line/bot-sdk'
 import { z } from 'zod'
 import { sign, verify } from 'hono/jwt'
-import { generateFlexMessages, createConfirmBubble } from './flexMessages'
+import { generateFlexMessages, createConfirmBubble, createSettingsBubble } from './flexMessages'
 
 type Bindings = {
   GOOGLE_CLIENT_ID: string
@@ -20,6 +20,8 @@ type Bindings = {
   ALLOWED_USERS: string
   JWT_SECRET: string
   ENVIRONMENT?: string
+  LINE_LIFF_ID: string
+  LINE_CHANNEL_ID: string
 }
 
 type GoogleTokenResponse = {
@@ -165,55 +167,129 @@ app.get('/auth/callback', async (c) => {
   return c.html(`<h1>連携完了</h1><p>LINEに戻ってください。</p>`)
 })
 
+// --- Settings UI (LIFF Version) ---
 
-// --- Settings UI ---
-
-// Entry Page
-app.get('/settings/entry', async (c) => {
-  const token = c.req.query('token')
-  if (!token) return c.text('Error', 403)
-  
+// 1. LIFF エントリーポイント (フロントエンド)
+// src/index.ts の app.get('/liff/entry') を書き換え
+app.get('/liff/entry', (c) => {
+  const liffId = c.env.LINE_LIFF_ID
   return c.html(`
     <!DOCTYPE html>
-    <html lang="ja">
-      <head>
-        <meta charset="utf-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>フィルタ設定</title>
-        <meta name="description" content="タップして設定画面を開きます">
-        <style>
-          body{display:flex;justify-content:center;align-items:center;height:100vh;background:#f0f0f0;font-family:sans-serif;color:#666;}
-          .loader {border: 4px solid #f3f3f3;border-top: 4px solid #3498db;border-radius: 50%;width: 30px;height: 30px;animation: spin 1s linear infinite;margin-bottom:10px;}
-          @keyframes spin {0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); }}
-          div{text-align:center;}
-        </style>
-        <script>window.onload = function() { document.getElementById('loginForm').submit(); }</script>
-      </head>
-      <body>
-        <div>
-          <div class="loader" style="margin:0 auto;"></div>
-          <p>設定画面へ移動中...</p>
-          <form id="loginForm" action="/settings/login" method="POST">
-            <input type="hidden" name="token" value="${token}">
-          </form>
-        </div>
-      </body>
+    <html>
+    <head>
+      <meta charset="UTF-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <title>プリカレ設定</title>
+      <script charset="utf-8" src="https://static.line-scdn.net/liff/edge/2/sdk.js"></script>
+      <style>
+        body {
+          font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+          display: flex;
+          flex-direction: column;
+          justify-content: center;
+          align-items: center;
+          height: 100vh;
+          margin: 0;
+          background-color: #f8f9fa;
+          color: #333;
+        }
+        .spinner {
+          width: 40px;
+          height: 40px;
+          border: 4px solid #e9ecef;
+          border-top: 4px solid #2c3e50;
+          border-radius: 50%;
+          animation: spin 1s linear infinite;
+          margin-bottom: 20px;
+        }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+        .message { font-size: 16px; font-weight: bold; color: #2c3e50; }
+        .sub-message { font-size: 12px; color: #888; margin-top: 8px; }
+      </style>
+    </head>
+    <body>
+      <div class="spinner"></div>
+      <div class="message" id="status">認証しています...</div>
+      <div class="sub-message">そのままお待ちください</div>
+
+      <script>
+        async function main() {
+          try {
+            // 1. LIFF初期化
+            await liff.init({ liffId: "${liffId}" })
+            
+            // 2. 未ログインならログイン画面へ
+            if (!liff.isLoggedIn()) {
+              liff.login()
+              return
+            }
+            
+            // 3. IDトークンを取得
+            const idToken = liff.getIDToken()
+            
+            // 4. バックエンド検証
+            const res = await fetch('/settings/login-liff', {
+              method: 'POST',
+              headers: {'Content-Type': 'application/json'},
+              body: JSON.stringify({ idToken })
+            })
+            
+            if (res.ok) {
+              window.location.href = '/settings'
+            } else {
+              document.getElementById('status').innerText = '認証に失敗しました。LINEから開き直してください。'
+            }
+          } catch(e) {
+            document.getElementById('status').innerText = 'エラーが発生しました: ' + e
+          }
+        }
+        main()
+      </script>
+    </body>
     </html>
   `)
 })
 
-// Login Action
-app.post('/settings/login', async (c) => {
-  const body = await c.req.parseBody()
-  const token = body['token'] as string
-  if (!token) return c.text('Invalid Request', 400)
+// 2. LIFF ログイン検証 API (バックエンド)
+app.post('/settings/login-liff', async (c) => {
+  const body = await c.req.json()
+  const idToken = body.idToken
+  
+  if (!idToken) return c.text('No Token', 400)
 
-  try {
-    await verify(token, c.env.JWT_SECRET, 'HS256')
-    const isSecure = c.env.ENVIRONMENT !== 'local'
-    setCookie(c, 'auth_token', token, { httpOnly: true, secure: isSecure, path: '/', maxAge: 3600, sameSite: 'Lax' })
-    return c.redirect('/settings')
-  } catch (e) { return c.text('Invalid or Expired Token', 403) }
+  // LINE公式APIで IDトークン を検証
+  const params = new URLSearchParams()
+  params.append('id_token', idToken)
+  params.append('client_id', c.env.LINE_CHANNEL_ID)
+
+  const verifyRes = await fetch('https://api.line.me/oauth2/v2.1/verify', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: params
+  })
+
+  if (!verifyRes.ok) {
+    console.error('Token Verify Error:', await verifyRes.text())
+    return c.text('Invalid Token', 403)
+  }
+  
+  const profile = await verifyRes.json() as any
+  const userId = profile.sub // ← これが「操作している本人」のLINE UserID
+
+  // 自社セッション(Cookie)を発行
+  const payload = { sub: userId, exp: Math.floor(Date.now() / 1000) + 3600 }
+  const sessionToken = await sign(payload, c.env.JWT_SECRET, 'HS256')
+  
+  const isSecure = c.env.ENVIRONMENT !== 'local'
+  setCookie(c, 'auth_token', sessionToken, { 
+    httpOnly: true, 
+    secure: isSecure, 
+    path: '/', 
+    maxAge: 3600,
+    sameSite: 'Lax' 
+  })
+  
+  return c.json({ success: true })
 })
 
 // Main Settings Page
@@ -669,19 +745,37 @@ async function handleEvents(events: WebhookEvent[], env: Bindings, reqUrl: strin
     // ---------------------------------------------------------
     // ■ 通常の画像処理フロー
     // ---------------------------------------------------------
+    // if (event.type === 'message' && event.message.type === 'text') {
+    //    if (event.message.text.includes('設定')) {
+    //      const userId = event.source.userId
+    //      if(!userId) continue
+    //      const payload = { sub: userId, exp: Math.floor(Date.now() / 1000) + 3600 }
+    //      const token = await sign(payload, env.JWT_SECRET, 'HS256')
+    //      const entryUrl = `${baseUrl}/settings/entry?token=${token}`
+    //      await client.replyMessage({
+    //        replyToken: event.replyToken,
+    //        messages: [{ type: 'text', text: `⚙️ 学年・クラスのフィルタ設定:\n${entryUrl}\n(リンクは1時間有効)` }]
+    //      })
+    //    }
+    //    continue
+    // }
     if (event.type === 'message' && event.message.type === 'text') {
-       if (event.message.text.includes('設定')) {
-         const userId = event.source.userId
-         if(!userId) continue
-         const payload = { sub: userId, exp: Math.floor(Date.now() / 1000) + 3600 }
-         const token = await sign(payload, env.JWT_SECRET, 'HS256')
-         const entryUrl = `${baseUrl}/settings/entry?token=${token}`
-         await client.replyMessage({
-           replyToken: event.replyToken,
-           messages: [{ type: 'text', text: `⚙️ 学年・クラスのフィルタ設定:\n${entryUrl}\n(リンクは1時間有効)` }]
-         })
-       }
-       continue
+      if (event.message.text.includes('設定')) {
+        // LIFFのURL (https://liff.line.me/...)
+        const liffUrl = `https://liff.line.me/${env.LINE_LIFF_ID}`
+        
+        const settingsMsg = createSettingsBubble(liffUrl)
+        
+        await client.replyMessage({
+          replyToken: event.replyToken,
+          messages: [{ 
+            type: 'flex', 
+            altText: '⚙️ プリカレ設定を開く', 
+            contents: settingsMsg 
+          }]
+        })
+      }
+      continue
     }
 
     // ---------------------------------------------------------

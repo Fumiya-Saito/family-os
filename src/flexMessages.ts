@@ -170,7 +170,7 @@ function createSummaryBubble(successCount: number, ignoredEvents: any[], message
       height: 'sm',
       action: {
         type: 'postback',
-        label: 'これも登録する', // ★分かりやすさ重視に変更
+        label: '除外された予定も登録する', // ★分かりやすさ重視に変更
         data: `action=rescue&msgId=${messageId}`,
         displayText: '除外された予定も追加で登録します'
       }
@@ -269,6 +269,91 @@ export function createConfirmBubble(messageId: string): FlexBubble {
             data: `action=analyze&msgId=${messageId}`, // ここで画像のIDを引き継ぐ
             displayText: '解析を開始します'
           }
+        }
+      ]
+    }
+  }
+}
+
+// 5. 【新設】設定画面への誘導カード
+export function createSettingsBubble(liffUrl: string): any {
+  return {
+    type: 'bubble',
+    size: 'kilo',
+    header: {
+      type: 'box',
+      layout: 'vertical',
+      contents: [
+        {
+          type: 'text',
+          text: '⚙️ プリカレ設定',
+          weight: 'bold',
+          color: '#ffffff',
+          size: 'md'
+        }
+      ],
+      backgroundColor: '#2c3e50', // ブランドカラー(濃いネイビー)で信頼感を
+      paddingAll: 'lg'
+    },
+    body: {
+      type: 'box',
+      layout: 'vertical',
+      contents: [
+        {
+          type: 'text',
+          text: '以下の設定を変更できます',
+          size: 'xs',
+          color: '#aaaaaa',
+          margin: 'none'
+        },
+        {
+          type: 'box',
+          layout: 'vertical',
+          margin: 'md',
+          spacing: 'sm',
+          contents: [
+            {
+              type: 'box',
+              layout: 'baseline',
+              contents: [
+                { type: 'text', text: '✅', flex: 1, size: 'xs' },
+                { type: 'text', text: '子供の学年・クラス設定', flex: 9, size: 'sm', color: '#666666' }
+              ]
+            },
+            {
+              type: 'box',
+              layout: 'baseline',
+              contents: [
+                { type: 'text', text: '📅', flex: 1, size: 'xs' },
+                { type: 'text', text: '保存先カレンダーの変更', flex: 9, size: 'sm', color: '#666666' }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    footer: {
+      type: 'box',
+      layout: 'vertical',
+      contents: [
+        {
+          type: 'button',
+          style: 'primary',
+          height: 'sm',
+          color: '#2c3e50',
+          action: {
+            type: 'uri',
+            label: '設定画面を開く',
+            uri: liffUrl
+          }
+        },
+        {
+          type: 'text',
+          text: '※本人確認のためLINEログインします',
+          size: 'xxs',
+          color: '#aaaaaa',
+          align: 'center',
+          margin: 'md'
         }
       ]
     }
