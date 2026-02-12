@@ -359,3 +359,76 @@ export function createSettingsBubble(liffUrl: string): any {
     }
   }
 }
+
+// src/flexMessages.ts の一番下に追加
+
+// 6. ヘルプ/使い方ガイド
+export function createHelpBubble(settingsUrl: string): any {
+  return {
+    type: 'bubble',
+    size: 'mega',
+    header: {
+      type: 'box',
+      layout: 'vertical',
+      contents: [
+        { type: 'text', text: '🔰 プリカレの使い方', weight: 'bold', color: '#ffffff', size: 'md' }
+      ],
+      backgroundColor: '#27ae60', // 親しみやすい緑色
+      paddingAll: 'lg'
+    },
+    body: {
+      type: 'box',
+      layout: 'vertical',
+      contents: [
+        {
+          type: 'text',
+          text: '学校のプリントを写真に撮って送るだけで、Googleカレンダーに予定を登録します📅',
+          wrap: true,
+          size: 'sm',
+          color: '#555555'
+        },
+        { type: 'separator', margin: 'lg' },
+        {
+          type: 'box',
+          layout: 'vertical',
+          margin: 'lg',
+          spacing: 'sm',
+          contents: [
+            { type: 'text', text: '📸 上手な使い方のコツ', weight: 'bold', size: 'sm', color: '#27ae60' },
+            { type: 'text', text: '・プリント全体が写るように撮影', size: 'xs', color: '#666666', wrap: true },
+            { type: 'text', text: '・明るい場所で、文字がブレないように', size: 'xs', color: '#666666', wrap: true },
+            { type: 'text', text: '・一度に1枚ずつ送信してください', size: 'xs', color: '#666666', wrap: true }
+          ]
+        },
+        { type: 'separator', margin: 'lg' },
+        {
+          type: 'box',
+          layout: 'vertical',
+          margin: 'lg',
+          spacing: 'sm',
+          contents: [
+            { type: 'text', text: '⚙️ 設定・変更', weight: 'bold', size: 'sm', color: '#27ae60' },
+            { type: 'text', text: 'お子様の学年設定や、保存先カレンダーの変更はこちらから👇', size: 'xs', color: '#666666', wrap: true }
+          ]
+        }
+      ]
+    },
+    footer: {
+      type: 'box',
+      layout: 'vertical',
+      contents: [
+        {
+          type: 'button',
+          style: 'primary',
+          height: 'sm',
+          color: '#27ae60',
+          action: {
+            type: 'uri',
+            label: '設定画面を開く',
+            uri: settingsUrl
+          }
+        }
+      ]
+    }
+  }
+}

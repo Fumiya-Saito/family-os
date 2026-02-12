@@ -6,7 +6,7 @@ import { GoogleGenerativeAI } from '@google/generative-ai'
 import { messagingApi, WebhookEvent } from '@line/bot-sdk'
 import { z } from 'zod'
 import { sign, verify } from 'hono/jwt'
-import { generateFlexMessages, createConfirmBubble, createSettingsBubble } from './flexMessages'
+import { generateFlexMessages, createConfirmBubble, createSettingsBubble, createHelpBubble } from './flexMessages'
 
 type Bindings = {
   GOOGLE_CLIENT_ID: string
@@ -90,6 +90,19 @@ async function verifyLineSignature(body: string, signature: string, secret: stri
   return await crypto.subtle.verify('HMAC', key, signatureBytes, encoder.encode(body))
 }
 
+// 書き込み可能なカレンダー一覧を取得
+async function getWritableCalendars(accessToken: string) {
+  try {
+    const res = await fetchWithRetry('https://www.googleapis.com/calendar/v3/users/me/calendarList', {
+      headers: { Authorization: `Bearer ${accessToken}` }
+    })
+    if (!res.ok) return []
+    const data = await res.json() as any
+    // owner(所有者) または writer(編集者) 権限があるもののみ抽出
+    return data.items.filter((c: any) => c.accessRole === 'owner' || c.accessRole === 'writer')
+  } catch { return [] }
+}
+
 // --- Routes ---
 
 app.get('/', (c) => c.text('Print2Cal Bot is Active! 🛡️'))
@@ -113,7 +126,7 @@ app.get('/auth', (c) => {
     client_id: c.env.GOOGLE_CLIENT_ID,
     redirect_uri: c.env.GOOGLE_REDIRECT_URI,
     response_type: 'code',
-    scope: 'https://www.googleapis.com/auth/calendar.events',
+    scope: 'https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/calendar.readonly',
     access_type: 'offline',
     prompt: 'consent',
     state: state,
@@ -293,6 +306,9 @@ app.post('/settings/login-liff', async (c) => {
 })
 
 // Main Settings Page
+// src/index.ts (GET /settings を置換)
+
+// Main Settings Page
 app.get('/settings', async (c) => {
   const token = getCookie(c, 'auth_token')
   if (!token) return c.text('セッション切れです。LINEから開き直してください。', 403)
@@ -304,51 +320,178 @@ app.get('/settings', async (c) => {
   } catch (e) { return c.text('Invalid Session', 403) }
 
   const supabase = createClient(c.env.SUPABASE_URL, c.env.SUPABASE_KEY)
-  const { data } = await supabase.from('users').select('keywords').eq('line_user_id', userId).single()
-  const keywords: string[] = data?.keywords || []
+  
+  // ユーザー設定（キーワード + カレンダーID）を取得
+  const { data: userData } = await supabase.from('users').select('keywords, calendar_id').eq('line_user_id', userId).single()
+  const keywords: string[] = userData?.keywords || []
+  const currentCalendarId = userData?.calendar_id || 'primary'
+
+  // カレンダー一覧を取得
+  let calendars: any[] = []
+  try {
+    const { data: authData } = await supabase.from('google_auth').select('access_token').eq('user_id', userId).single()
+    if (authData) {
+      calendars = await getWritableCalendars(authData.access_token)
+    }
+  } catch(e) { console.error(e) }
+
+  // src/index.ts (GET /settings のHTML生成部分のみ抜粋・置換)
 
   return c.html(`
     <!DOCTYPE html>
     <html lang="ja">
       <head>
         <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>フィルタ設定</title>
+        <title>プリカレ設定</title>
         <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@1/css/pico.min.css">
-        <style>.tag{display:inline-block;background:#eee;color:#333;padding:4px 8px;border-radius:4px;margin:2px;} button.del{border:none;background:none;color:red;cursor:pointer;padding:0 5px;}</style>
+        <style>
+          /* ベーススタイル */
+          body { padding:1rem; max-width:600px; margin:0 auto; color: #2c3e50; }
+          
+          /* カード風デザイン */
+          section {
+            background: #fff;
+            padding: 20px;
+            border-radius: 12px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+            margin-bottom: 24px;
+            border: 1px solid #eee;
+          }
+          
+          h3 { font-size: 1.1rem; border-bottom: 2px solid #f0f0f0; padding-bottom: 10px; margin-bottom: 15px; }
+          p { font-size: 0.9rem; color: #666; margin-bottom: 15px; }
+          small { color: #888; }
+
+          /* カレンダー選択リスト */
+          .cal-list { display: flex; flex-direction: column; gap: 8px; }
+          .cal-item {
+            position: relative;
+            padding: 12px 16px;
+            border: 2px solid #eee;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: all 0.2s;
+            display: flex;
+            align-items: center;
+          }
+          /* ラジオボタンは隠して、ラベル全体をクリック可能に */
+          .cal-item input[type="radio"] { display: none; }
+          
+          /* 選択時のスタイル */
+          .cal-item:has(input:checked) {
+            border-color: #3498db;
+            background-color: #f0f8ff;
+          }
+          .cal-item:has(input:checked)::after {
+            content: '✔';
+            position: absolute;
+            right: 15px;
+            color: #3498db;
+            font-weight: bold;
+          }
+
+          .cal-color { width: 14px; height: 14px; border-radius: 50%; margin-right: 12px; flex-shrink: 0; }
+          .cal-name { font-weight: bold; font-size: 0.95rem; }
+          .cal-badge { 
+            font-size: 0.7rem; background: #eee; padding: 2px 6px; border-radius: 4px; margin-left: 8px; color: #555;
+          }
+          
+          /* タグスタイル */
+          .tag { display:inline-flex; align-items:center; background:#eef2f5; color:#333; padding:4px 10px; border-radius:20px; margin:4px; font-size: 0.9rem; }
+          button.del { border:none; background:none; color:#999; cursor:pointer; padding:0 0 0 8px; font-size: 1.1rem; line-height: 1; }
+          button.del:hover { color: #e74c3c; }
+          
+          /* ボタン */
+          button[type="submit"] { background-color: #2c3e50; border: none; font-weight: bold; }
+          button.secondary { background-color: #95a5a6; }
+        </style>
       </head>
-      <body style="padding:1rem;max-width:600px;margin:0 auto;">
+      <body>
         <main>
-          <h3>⚙️ 学年・クラスのフィルタ設定</h3>
-          <p>
-            ここに追加したキーワード（学年やクラス名）が含まれる予定を<br>
-            <strong>「抽出」</strong>してカレンダーに登録します。<br>
-            <small>※何も設定しない場合は、全ての予定が登録されます。</small>
-          </p>
-          <article>
-            <div>
-              ${keywords.length === 0 ? '<small>設定なし（全件登録）</small>' : ''}
-              ${keywords.map((k: string) => `
-                <span class="tag">${sanitizeText(k, 20)}
-                  <form action="/settings/update" method="POST" style="display:inline">
-                    <input type="hidden" name="action" value="delete">
-                    <input type="hidden" name="word" value="${sanitizeText(k)}">
-                    <button type="submit" class="del">×</button>
-                  </form>
-                </span>
+          
+          <section>
+            <h3>📅 予定の登録先（誰のカレンダー？）</h3>
+            <p>
+              プリントの予定を書き込むカレンダーを選んでください。<br>
+              <small>例: 「家族共有用」や「お子様専用」のカレンダーに分けることができます。</small>
+            </p>
+            
+            <form action="/settings/update_calendar" method="POST">
+              ${calendars.length === 0 ? '<p style="color:#e74c3c;">⚠️ カレンダー情報を取得できませんでした。<br>Botのトーク画面に戻り、再度連携を行ってください。</p>' : ''}
+              
+              <div class="cal-list">
+              ${calendars.map((c: any) => `
+                <label class="cal-item">
+                  <input type="radio" name="calendar_id" value="${c.id}" ${c.id === currentCalendarId ? 'checked' : ''}>
+                  <span class="cal-color" style="background-color:${c.backgroundColor}"></span>
+                  <div>
+                    <span class="cal-name">${sanitizeText(c.summary, 20)}</span>
+                    ${c.primary ? '<span class="cal-badge">いつものカレンダー</span>' : ''}
+                    ${c.summary.includes('ファミリー') || c.summary.includes('家族') ? '<span class="cal-badge">家族共有</span>' : ''}
+                  </div>
+                </label>
               `).join('')}
-            </div>
-          </article>
-          <article>
-            <form action="/settings/update" method="POST">
-              <input type="hidden" name="action" value="add">
-              <label>追加<input type="text" name="word" placeholder="例: 年長" required maxlength="20"></label>
-              <button type="submit">追加</button>
+              </div>
+              
+              <button type="submit" style="margin-top:20px;">保存先を変更する</button>
             </form>
-          </article>
+          </section>
+
+          <section>
+            <h3>⚙️ 抽出するキーワード（学年・クラス）</h3>
+            <p>
+              自分に関係のある行事だけを自動でピックアップします。<br>
+              <small>※何も設定しないと、プリントに書かれた全ての行事が登録されます。</small>
+            </p>
+            
+            <article style="border:none; padding:0; box-shadow:none;">
+              <div style="margin-bottom:15px;">
+                ${keywords.length === 0 ? '<small>設定なし（全件登録）</small>' : ''}
+                ${keywords.map((k: string) => `
+                  <span class="tag">
+                    ${sanitizeText(k, 20)}
+                    <form action="/settings/update" method="POST" style="display:inline">
+                      <input type="hidden" name="action" value="delete">
+                      <input type="hidden" name="word" value="${sanitizeText(k)}">
+                      <button type="submit" class="del">×</button>
+                    </form>
+                  </span>
+                `).join('')}
+              </div>
+              
+              <form action="/settings/update" method="POST" style="display:flex; gap:10px;">
+                <input type="hidden" name="action" value="add">
+                <input type="text" name="word" placeholder="例: 1年2組, 年長" required maxlength="20" style="margin-bottom:0;">
+                <button type="submit" class="secondary" style="width:auto; white-space:nowrap;">追加</button>
+              </form>
+            </article>
+          </section>
+
         </main>
       </body>
     </html>
   `)
+})
+
+// Update Calendar Action
+app.post('/settings/update_calendar', async (c) => {
+  const token = getCookie(c, 'auth_token')
+  if (!token) return c.text('Session Error', 403)
+  
+  let userId
+  try {
+    const payload = await verify(token, c.env.JWT_SECRET, 'HS256')
+    userId = payload.sub as string
+  } catch (e) { return c.text('Invalid Session', 403) }
+
+  const body = await c.req.parseBody()
+  const calendarId = body['calendar_id'] as string
+
+  if (calendarId) {
+    const supabase = createClient(c.env.SUPABASE_URL, c.env.SUPABASE_KEY)
+    await supabase.from('users').update({ calendar_id: calendarId }).eq('line_user_id', userId)
+  }
+  return c.redirect('/settings')
 })
 
 // Update Action
@@ -437,9 +580,10 @@ async function handleEvents(events: WebhookEvent[], env: Bindings, reqUrl: strin
 
          try {
              // ユーザー情報・認証取得
-             const { data: userData } = await supabase.from('users').select('keywords').eq('line_user_id', userId).single()
+             const { data: userData } = await supabase.from('users').select('keywords, calendar_id').eq('line_user_id', userId).single()
              const { data: authData } = await supabase.from('google_auth').select('*').eq('user_id', userId).single()
              const userKeywords: string[] = userData?.keywords || []
+             const targetCalendarId = userData?.calendar_id || 'primary'
 
              if (!authData) {
                 const payload = { sub: userId, exp: Math.floor(Date.now() / 1000) + 600 }
@@ -571,7 +715,7 @@ async function handleEvents(events: WebhookEvent[], env: Bindings, reqUrl: strin
 
              // カレンダー登録
              const calendarPromises = keptEvents.map(async (ev) => {
-               const res = await fetchWithRetry('https://www.googleapis.com/calendar/v3/calendars/primary/events', {
+               const res = await fetchWithRetry(`https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(targetCalendarId)}/events`, {
                    method: 'POST',
                    headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
                    body: JSON.stringify({
@@ -662,9 +806,12 @@ async function handleEvents(events: WebhookEvent[], env: Bindings, reqUrl: strin
            await supabase.from('google_auth').update({ access_token: accessToken, expiry_date: Date.now() + 3500 * 1000 }).eq('user_id', userId)
         }
 
+        const { data: userDataForUndo } = await supabase.from('users').select('calendar_id').eq('line_user_id', userId).single()
+        const calendarIdForUndo = userDataForUndo?.calendar_id || 'primary'
+
         let deletedCount = 0
         for (const ev of eventsToDelete) {
-          const res = await fetchWithRetry(`https://www.googleapis.com/calendar/v3/calendars/primary/events/${ev.google_event_id}`, {
+          const res = await fetchWithRetry(`https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarIdForUndo)}/events/${ev.google_event_id}`, {
             method: 'DELETE',
             headers: { Authorization: `Bearer ${accessToken}` }
           })
@@ -699,8 +846,11 @@ async function handleEvents(events: WebhookEvent[], env: Bindings, reqUrl: strin
            await supabase.from('google_auth').update({ access_token: accessToken, expiry_date: Date.now() + 3500 * 1000 }).eq('user_id', userId)
         }
 
+        const { data: userDataForRescue } = await supabase.from('users').select('calendar_id').eq('line_user_id', userId).single()
+        const targetCalendarId = userDataForRescue?.calendar_id || 'primary'
+
         const rescuePromises = ignoredEvents.map(async (ev) => {
-          const res = await fetchWithRetry('https://www.googleapis.com/calendar/v3/calendars/primary/events', {
+          const res = await fetchWithRetry(`https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(targetCalendarId)}/events`, {
               method: 'POST',
               headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
               body: JSON.stringify({
@@ -743,39 +893,37 @@ async function handleEvents(events: WebhookEvent[], env: Bindings, reqUrl: strin
     }
 
     // ---------------------------------------------------------
-    // ■ 通常の画像処理フロー
+    // ■ テキストメッセージ処理 (特定キーワードのみ反応)
     // ---------------------------------------------------------
-    // if (event.type === 'message' && event.message.type === 'text') {
-    //    if (event.message.text.includes('設定')) {
-    //      const userId = event.source.userId
-    //      if(!userId) continue
-    //      const payload = { sub: userId, exp: Math.floor(Date.now() / 1000) + 3600 }
-    //      const token = await sign(payload, env.JWT_SECRET, 'HS256')
-    //      const entryUrl = `${baseUrl}/settings/entry?token=${token}`
-    //      await client.replyMessage({
-    //        replyToken: event.replyToken,
-    //        messages: [{ type: 'text', text: `⚙️ 学年・クラスのフィルタ設定:\n${entryUrl}\n(リンクは1時間有効)` }]
-    //      })
-    //    }
-    //    continue
-    // }
     if (event.type === 'message' && event.message.type === 'text') {
-      if (event.message.text.includes('設定')) {
-        // LIFFのURL (https://liff.line.me/...)
-        const liffUrl = `https://liff.line.me/${env.LINE_LIFF_ID}`
-        
-        const settingsMsg = createSettingsBubble(liffUrl)
-        
-        await client.replyMessage({
-          replyToken: event.replyToken,
-          messages: [{ 
-            type: 'flex', 
-            altText: '⚙️ プリカレ設定を開く', 
-            contents: settingsMsg 
-          }]
-        })
-      }
-      continue
+       const rawText = event.message.text
+       const liffUrl = `https://liff.line.me/${env.LINE_LIFF_ID}`
+
+       // 1. 表記ゆれを吸収する正規化（全角英数→半角、大文字→小文字、空白除去）
+       // 例: "Ｈｅｌｐ " -> "help", " 設定" -> "設定"
+       const text = rawText.trim()
+         .replace(/[Ａ-Ｚａ-ｚ０-９]/g, s => String.fromCharCode(s.charCodeAt(0) - 0xFEE0))
+         .toLowerCase()
+
+       // 2. 設定コマンド (設定, setting 等)
+       if (text === '設定' || text === 'setting') {
+         const settingsMsg = createSettingsBubble(liffUrl)
+         await client.replyMessage({
+           replyToken: event.replyToken,
+           messages: [{ type: 'flex', altText: '⚙️ プリカレ設定', contents: settingsMsg }]
+         })
+       } 
+       // 3. ヘルプコマンド (使い方, ヘルプ, help 等)
+       else if (['使い方', 'ヘルプ', 'help', 'ガイド'].includes(text)) {
+         const helpMsg = createHelpBubble(liffUrl)
+         await client.replyMessage({
+           replyToken: event.replyToken,
+           messages: [{ type: 'flex', altText: '🔰 プリカレの使い方', contents: helpMsg }]
+         })
+       }
+       
+       // 4. それ以外の会話は完全スルー (グループでの誤爆防止)
+       continue
     }
 
     // ---------------------------------------------------------
